@@ -1,10 +1,6 @@
 import logging
 import os
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-
-load_dotenv()
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
@@ -12,6 +8,11 @@ from app.github_client import GitHubClient, GitHubClientError
 from app.llm_client import LLMClient, LLMError
 from app.models import ErrorResponse, SummarizeRequest, SummarizeResponse
 from app.repo_processor import collect_repo_context
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -61,7 +62,7 @@ async def summarize(request: SummarizeRequest):
         branch = await github.get_default_branch(owner, repo)
         logger.info("Default branch: %s", branch)
 
-        files = await github.get_repo_tree(owner, repo, branch)
+        files, tree = await github.get_repo_tree(owner, repo, branch)
         if not files:
             return JSONResponse(
                 status_code=400,
@@ -71,7 +72,7 @@ async def summarize(request: SummarizeRequest):
             )
         logger.info("Found %d files in repo tree", len(files))
 
-        context = await collect_repo_context(github, files)
+        context = await collect_repo_context(github, files, owner, repo, branch)
         logger.info("Assembled context: %d characters", len(context))
 
     except GitHubClientError as e:
@@ -94,7 +95,7 @@ async def summarize(request: SummarizeRequest):
 
     llm = _get_llm_client()
     try:
-        result = await llm.summarize(owner, repo, context)
+        result = await llm.summarize(owner, repo, context, tree)
         logger.info("Summary generated successfully")
         return result
     except LLMError as e:

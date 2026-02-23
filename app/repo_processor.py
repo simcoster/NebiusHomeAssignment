@@ -98,19 +98,23 @@ def _score_file(file: RepoFile) -> int:
     score = 0
 
     if name.upper().startswith("README"):
-        score += 1000
-    if name in HIGH_PRIORITY_FILENAMES:
-        score += 800
-    if name in MEDIUM_PRIORITY_FILENAMES or file.path in MEDIUM_PRIORITY_FILENAMES:
-        score += 500
+        score = 1000
+    elif name in HIGH_PRIORITY_FILENAMES:
+        score = 800
+    elif name in MEDIUM_PRIORITY_FILENAMES or file.path in MEDIUM_PRIORITY_FILENAMES:
+        score = 500
+    elif ext in CONFIG_EXTENSIONS:
+        score = 200
+    elif ext in SOURCE_EXTENSIONS:
+        score = 100
+        # Prefer test files among source files
+        if "test" in name.lower():
+            score + 50
 
-    if ext in CONFIG_EXTENSIONS:
-        score += 200
-    if ext in SOURCE_EXTENSIONS:
-        score += 100
-
-    # Prefer shallower files (top-level files are more informative)
-    score += max(0, 50 - depth * 10)
+    if "README.md" in name and depth == 2:
+        pass
+    # Strongly prefer top-level files; heavily penalize depth 2+
+    score -= depth * 500  # depth 1: 0, depth 2: -500, depth 3: -1000, ...
 
     # Prefer smaller files (they're usually more focused)
     if file.size < 2000:
@@ -149,17 +153,10 @@ def filter_files(files: list[RepoFile]) -> list[RepoFile]:
     return filtered
 
 
-def build_directory_tree(files: list[RepoFile], max_lines: int = 150) -> str:
-    """Build a compact directory tree representation."""
-    dirs: set[str] = set()
-    file_paths: list[str] = []
-
-    for f in files:
-        file_paths.append(f.path)
-        parts = PurePosixPath(f.path).parts
-        for i in range(1, len(parts)):
-            dirs.add("/".join(parts[:i]) + "/")
-
+def _build_tree_full(
+    dirs: set[str], file_paths: list[str], max_lines: int
+) -> list[str]:
+    """Render a full indented directory tree (used when dirs <= 100)."""
     all_entries = sorted(dirs) + sorted(file_paths)
     lines = []
     for entry in all_entries:
@@ -174,6 +171,84 @@ def build_directory_tree(files: list[RepoFile], max_lines: int = 150) -> str:
         if len(lines) >= max_lines:
             lines.append(f"  ... ({len(all_entries) - max_lines} more entries)")
             break
+    return lines
+
+
+def _build_tree_summary(file_paths: list[str], max_lines: int) -> list[str]:
+    """Render a top-level summary tree (used when dirs > 100)."""
+    from collections import Counter
+
+    top_level_dirs: set[str] = set()
+    top_level_files: list[str] = []
+    for fpath in file_paths:
+        p = PurePosixPath(fpath)
+        if len(p.parts) == 1:
+            top_level_files.append(fpath)
+        else:
+            top_level_dirs.add(p.parts[0])
+
+    lines = ["[Summary — over 100 directories, showing top level breakdown]"]
+
+    if top_level_files:
+        lines.append("")
+        lines.append("Top-level files:")
+        sorted_top = sorted(top_level_files)
+        for fpath in sorted_top[:30]:
+            lines.append(f"  {fpath}")
+        if len(sorted_top) > 30:
+            remaining = sorted_top[30:]
+            type_counts: Counter = Counter(PurePosixPath(f).suffix or "(no_ext)" for f in remaining)
+            type_str = ", ".join(f"{typ}: {cnt}" for typ, cnt in type_counts.most_common())
+            lines.append(f"  ... ({len(remaining)} more: {type_str})")
+
+    for d in sorted(top_level_dirs):
+        file_types: Counter = Counter()
+        subdirs: set[str] = set()
+        for fpath in file_paths:
+            p = PurePosixPath(fpath)
+            if p.parts and p.parts[0] == d:
+                if len(p.parts) == 2:
+                    file_types[p.suffix or "(no_ext)"] += 1
+                elif len(p.parts) > 2:
+                    subdirs.add(p.parts[1])
+                    file_types[p.suffix or "(no_ext)"] += 1
+        lines.append("")
+        lines.append(f"{d}/")
+        if subdirs:
+            sample = ", ".join(sorted(subdirs)[:5])
+            ellipsis = "..." if len(subdirs) > 5 else ""
+            lines.append(f"  Sub-directories: {len(subdirs)} ({sample}{ellipsis})")
+        else:
+            lines.append("  Sub-directories: 0")
+        if file_types:
+            top_types = file_types.most_common(5)
+            str_types = ", ".join(f"{typ}: {cnt}" for typ, cnt in top_types)
+            extra = f", ... ({sum(file_types.values())} files)" if len(file_types) > 5 else ""
+            lines.append(f"  File types: {str_types}{extra}")
+        else:
+            lines.append("  No files detected")
+        if len(lines) > max_lines:
+            lines.append("  ... (output truncated)")
+            break
+
+    return lines
+
+
+def build_directory_tree(files: list[RepoFile], max_lines: int = 150) -> str:
+    """Build a compact directory tree representation."""
+    dirs: set[str] = set()
+    file_paths: list[str] = []
+
+    for f in files:
+        file_paths.append(f.path)
+        parts = PurePosixPath(f.path).parts
+        for i in range(1, len(parts)):
+            dirs.add("/".join(parts[:i]) + "/")
+
+    if len(dirs) > 100:
+        lines = _build_tree_summary(file_paths, max_lines)
+    else:
+        lines = _build_tree_full(dirs, file_paths, max_lines)
 
     return "\n".join(lines)
 
@@ -187,6 +262,9 @@ def truncate_content(content: str, max_chars: int = MAX_FILE_CHARS) -> str:
 async def collect_repo_context(
     client: GitHubClient,
     files: list[RepoFile],
+    owner: str,
+    repo: str,
+    branch: str,
 ) -> str:
     """Fetch file contents and assemble the context string for the LLM."""
     prioritized = filter_files(files)
@@ -196,9 +274,13 @@ async def collect_repo_context(
 
     async def _fetch(f: RepoFile):
         async with semaphore:
-            content = await client.fetch_file_content(f)
+            content, commit_info = await asyncio.gather(
+                client.fetch_file_content(f),
+                client.get_file_commit_info(owner, repo, branch, f.path),
+            )
             if content is not None:
                 f.content = content
+            f.last_commit_timestamp, f.commit_count = commit_info
 
     await asyncio.gather(*[_fetch(f) for f in to_fetch])
 
@@ -210,7 +292,14 @@ async def collect_repo_context(
         if f.content is None:
             continue
         content = truncate_content(f.content)
-        section = f"## File: {f.path}\n```\n{content}\n```\n"
+        last_commit = f.last_commit_timestamp or "unknown"
+        commit_count = f.commit_count if f.commit_count is not None else "unknown"
+        section = (
+            f"## File: {f.path}\n"
+            f"Last commit timestamp: {last_commit}\n"
+            f"Commit count: {commit_count}\n"
+            f"```\n{content}\n```\n"
+        )
 
         if total_chars + len(section) > MAX_CONTEXT_CHARS:
             remaining = MAX_CONTEXT_CHARS - total_chars

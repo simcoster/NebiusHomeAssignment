@@ -11,20 +11,19 @@ NEBIUS_API_BASE = "https://api.studio.nebius.com/v1/"
 MODEL = "meta-llama/Meta-Llama-3.1-70B-Instruct"
 
 SYSTEM_PROMPT = """\
-You are a software project analyst. Given the contents of a GitHub repository, \
-produce a structured JSON analysis with exactly three fields:
+You are a software project analyst. Given the contents of a GitHub repository—where each content section is marked and sorted by an edit timestamp—produce a structured JSON analysis with exactly three fields:
 
-1. "summary": A clear, human-readable description (2-4 sentences) of what the \
-project does, its purpose, and who it's for. Be specific and informative.
+If there is contradictory information in the repository contents, always prefer and use the information from the newer timestamp.
 
-2. "technologies": A JSON array of strings listing the main programming languages, \
-frameworks, libraries, and tools the project uses. Include only significant \
-dependencies, not every transitive package. Order by importance.
+1. "summary": A clear, human-readable description (2-4 sentences) of what the project does, its purpose, and who it's for. Be specific and informative.
 
-3. "structure": A brief description (2-3 sentences) of how the project is organized. \
-Mention key directories and their purposes.
+2. "technologies": A JSON array of strings listing the main programming languages, frameworks, libraries, and tools the project uses. Include only significant dependencies, not every transitive package. Order by importance.
 
-Respond ONLY with valid JSON. No markdown, no code fences, no extra text.\
+3. "structure": A brief description (2-3 sentences) of how the project is organized. Focus on the purpose and relationships between major parts, not just directory names. 
+For example: where the core logic lives, where tests are, how the project is built, 
+and any notable architectural patterns (e.g. plugin system, monorepo, library + CLI, etc.).
+
+Respond ONLY with valid JSON. No markdown, no code fences, no extra text.
 """
 
 USER_PROMPT_TEMPLATE = """\
@@ -48,10 +47,10 @@ class LLMClient:
         self._model = model
 
     async def summarize(
-        self, owner: str, repo: str, context: str
+        self, owner: str, repo: str, context: str, tree: list[dict]
     ) -> SummarizeResponse:
         user_prompt = USER_PROMPT_TEMPLATE.format(
-            owner=owner, repo=repo, context=context
+            owner=owner, repo=repo, context=context, tree=json.dumps(tree)
         )
 
         try:
